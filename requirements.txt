@@ -1,14 +1,11 @@
-faiss-cpu
-ollama
-sentence-transformers
-nltk
-rank_bm25
-streamlit
-#numpy==1.24.0  # (Uncomment if you need a specific version)
-PyMuPDF
-pandas
-re  # (Part of Python standard library, no need to install)
-os  # (Part of Python standard library, no need to install)
-faiss-cpu
-ollama
-sentence-transformers
+nltk==3.6.2
+rank_bm25==0.2
+streamlit==0.72.0
+PyMuPDF==1.18.14
+numpy==1.24.0 
+pandas==1.2.1  
+pandas-profiling==3.2.0
+ollama==0.4.7 
+transformers==4.3.3
+sentence-transformers==1.1.0
+faiss-cpu==1.7.0
