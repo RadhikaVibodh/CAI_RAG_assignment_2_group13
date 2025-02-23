@@ -1,108 +1,131 @@
-#Data Collection & Preprocessing
-import os  # Add this line at the top of your script
+import os
 import faiss
-import fitz  # PyMuPDF for PDF processing
-import re  # Regular expressions for text cleaning
+import fitz
+import re
+import numpy as np
+import torch
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-import ollama
-import pandas as pd  # Pandas for CSV processing
-import numpy as np  # NumPy for array operations
-''
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from rank_bm25 import BM25Okapi
+from collections import defaultdict
+
+# ------------------- Step 1: Extract & Clean Text -------------------
 def extract_text_from_pdf(pdf_path):
-    """Extracts text from a PDF file and cleans it."""
     doc = fitz.open(pdf_path)
-    text = ""
-
-    for page in doc:
-        text += page.get_text("text") + "\n"
-
+    text = "".join([page.get_text("text") for page in doc])
     return clean_text(text)
 
-#def extract_text_from_csv(csv_path):
-#   """Extracts text from a CSV file and cleans it."""
-#  df = pd.read_csv(csv_path)  # Read CSV
-# text = df.to_string(index=False)  # Convert entire DataFrame to a text format
-    
-#    return clean_text(text)
-
 def clean_text(text):
-    """Cleans extracted text by removing unnecessary symbols and extra spaces."""
-    text = re.sub(r'\s+', ' ', text)  # Replace multiple spaces/newlines with a single space
+    text = re.sub(r'\s+', ' ', text)  # Remove extra spaces/newlines
     text = re.sub(r'[^\x00-\x7F]+', '', text)  # Remove non-ASCII characters
-    text = text.strip()
-    return text
+    return text.strip()
 
-def process_files(input_folder, output_folder):
-    """Processes all PDFs and CSVs in a folder and saves cleaned text."""
-    os.makedirs(output_folder, exist_ok=True)
+# ------------------- Step 2: Load Models -------------------
+embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+phi2_model = "microsoft/phi-2"
+tokenizer = AutoTokenizer.from_pretrained(phi2_model)
+model = AutoModelForCausalLM.from_pretrained(phi2_model, torch_dtype=torch.float16, device_map="auto")
+
+# ------------------- Step 3: Indexing (FAISS + BM25) -------------------
+def process_files(input_folder):
+    text_chunks = []
+    chunk_embeddings = []
+
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=50)
 
     for filename in os.listdir(input_folder):
-        file_path = os.path.join(input_folder, filename)
-        output_file = os.path.join(output_folder, filename + ".txt")
-
         if filename.endswith(".pdf"):
-            text = extract_text_from_pdf(file_path)
-        #elif filename.endswith(".csv"):
-         #   text = extract_text_from_csv(file_path)
-        else:
-            continue  # Skip unsupported files
+            print(f"Processing file: {filename}")
+            file_path = os.path.join(input_folder, filename)
+            pdf_text = extract_text_from_pdf(file_path)
+            chunks = text_splitter.split_text(pdf_text)
+            text_chunks.extend(chunks)
+            chunk_embeddings.extend(embed_model.encode(chunks))
 
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(text)
+    embeddings = np.array(chunk_embeddings, dtype=np.float32)
 
-        print(f"Processed: {filename} -> {output_file}")
+    # FAISS Index
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(embeddings)
 
-# Example Usage
-input_folder = r'C:\Users\swara\Downloads\BITS\sem_3\CAI\Assignment\assignment_2\input_folder'
-output_folder = r'C:\Users\swara\Downloads\BITS\sem_3\CAI\Assignment\assignment_2\output_folder'
-process_files(input_folder, output_folder)
+    # BM25 Index
+    bm25 = BM25Okapi([chunk.split() for chunk in text_chunks])
 
-#2. Basic RAG Implementation
+    return index, text_chunks, bm25
 
+# ------------------- Step 4: Multi-Stage Retrieval -------------------
+def retrieve_top_k(index, bm25, text_chunks, query, k=20):
+    """Stage 1: Retrieve top candidates from FAISS & BM25."""
+    query_embedding = embed_model.encode([query]).astype(np.float32)
 
-# Load preprocessed text files from your output folder
+    # FAISS Search
+    faiss_distances, faiss_indices = index.search(query_embedding, k)
 
-text_files = [os.path.join(output_folder, f) for f in os.listdir(output_folder) if f.endswith(".txt")]
+    # BM25 Search
+    bm25_scores = bm25.get_scores(query.split())
+    bm25_top_indices = np.argsort(bm25_scores)[-k:][::-1]
 
-documents = []
-for file in text_files:
-    with open(file, "r", encoding="utf-8") as f:
-        documents.append(f.read())
+    # Merge results
+    combined_results = defaultdict(float)
 
-# Text chunking
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-chunks = text_splitter.split_text("\n".join(documents))
-text_chunks = chunks  # Each element is a text chunk
+    for i, d in zip(faiss_indices[0], faiss_distances[0]):
+        combined_results[i] += (1 / (1 + d))  # Convert distance to score
 
-# Generate embeddings using Ollama (nomic-embed-text)
-def get_embedding(text):
-    response = ollama.embeddings(model="nomic-embed-text", prompt=text)
-    return np.array(response["embedding"], dtype=np.float32)
+    for i in bm25_top_indices:
+        combined_results[i] += bm25_scores[i]
 
-embeddings = np.array([get_embedding(chunk) for chunk in text_chunks])
+    # Sort by combined scores (Hybrid Search)
+    top_candidates = sorted(combined_results.items(), key=lambda x: x[1], reverse=True)[:k]
 
-# Store embeddings in FAISS
-index = faiss.IndexFlatL2(embeddings.shape[1])
-index.add(embeddings)
+    # Stage 2: Re-ranking
+    ranked_results = reranker.predict([(query, text_chunks[i]) for i, _ in top_candidates])
+    ranked_indices = [i for i, _ in sorted(zip([i for i, _ in top_candidates], ranked_results), key=lambda x: x[1], reverse=True)]
 
-# Function to retrieve top-k relevant chunks
-def retrieve_relevant_chunks(query, top_k=5):
-    query_embedding = get_embedding(query).reshape(1, -1)
-    distances, indices = index.search(query_embedding, top_k)
-    return [text_chunks[i] for i in indices[0]]
+    # Stage 3: Merge Adjacent Chunks for Better Context
+    final_text = " ".join([text_chunks[i] for i in ranked_indices[:5]])
+    return final_text
 
-# Function to generate response using Ollama LLM
-def generate_response(query):
-    retrieved_chunks = retrieve_relevant_chunks(query)
-    context = "\n".join(retrieved_chunks)
-    prompt = f"Based on the following information, answer the question:\n{context}\n\nQuestion: {query}"
-   # response = ollama.chat(model="mistral", messages=[{"role": "user", "content": prompt}])
-    response = ollama.chat(model="deepseek-r1:1.5b", messages=[{"role": "user", "content": prompt}])
+# ------------------- Step 5: Memory-Augmented Retrieval -------------------
+memory_cache = {}
 
-    return response["message"]["content"]
+def retrieve_with_memory(index, bm25, text_chunks, query, k=10):
+    """Check if query is similar to past queries for faster retrieval."""
+    if query in memory_cache:
+        print("Using cached retrieval")
+        return memory_cache[query]
 
-# Example query
+    retrieved_text = retrieve_top_k(index, bm25, text_chunks, query, k)
+    memory_cache[query] = retrieved_text  # Store in memory
+    return retrieved_text
+
+# ------------------- Step 6: Generate Answer -------------------
+def generate_answer(index, bm25, text_chunks, query):
+    relevant_text = retrieve_with_memory(index, bm25, text_chunks, query)
+    prompt = f"Based on the following information:\n{relevant_text}\nAnswer the query: {query}"
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda" if torch.cuda.is_available() else "cpu")
+
+    output_tokens = model.generate(
+        **inputs,
+        temperature=0.7,
+        top_k=50,
+        top_p=0.9,
+        num_beams=1,
+        do_sample=True,
+        use_cache=True
+    )
+
+    return tokenizer.decode(output_tokens[0], skip_special_tokens=True)
+
+# ------------------- Example Usage -------------------
+input_folder = './input_folder'
+index, text_chunks, bm25 = process_files(input_folder)
+
 query = "What were the total assets in 2023?"
-response = generate_response(query)
+response = generate_answer(index, bm25, text_chunks, query)
 print("Generated Response:", response)
 
+query = "What were the total revenue in 2023?"
+response = generate_answer(index, bm25, text_chunks, query)
+print("Generated Response:", response)
