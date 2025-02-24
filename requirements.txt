@@ -12,4 +12,6 @@ faiss-cpu==1.10.0
 langchain==0.3.19
 pymilvus==2.5.4
 packaging==24.2
-accelerate==1.4.0
+accelerate==1.4
+pdfplumber==0.11.5
+spacy==3.8.3
