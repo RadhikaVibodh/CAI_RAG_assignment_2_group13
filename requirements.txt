@@ -15,3 +15,4 @@ packaging==24.2
 accelerate==1.4
 pdfplumber==0.11.5
 spacy==3.8.3
+onnxruntime==1.19.2
